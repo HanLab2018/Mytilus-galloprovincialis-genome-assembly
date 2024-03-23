@@ -1,0 +1,211 @@
+# GenomeScope Profile
+meryl k=21 count output reads1.meryl illumina_1.fq
+meryl k=21 count output reads2.meryl illumina_2.fq
+meryl union-sum output genome.meryl read*.meryl
+genomescope2 -i reads21.histo -o kmer21 -k 21
+
+# Assembly
+nohup /home/hifiasm/hifiasm -o mgal -t 150 \
+--h1 FDHC220004608-1a_L1_1.fq.gz,FDHC220004608-1a_L2_1.fq.gz,FDHC220004608-1a_L3_1.fq.gz,FDHC220004608-1a_L4_1.fq.gz \
+--h2 FDHC220004608-1a_L1_2.fq.gz,FDHC220004608-1a_L2_2.fq.gz,FDHC220004608-1a_L3_2.fq.gz,FDHC220004608-1a_L4_2.fq.gz \
+hifi.reads.fastq.gz --primary > hifi_assembly_hic_primary.log 2>&1 &
+
+# purge_dups
+minimap2 -x map-hifi -t 75 mgal.hic.a_ctg.fa m64268e_220804_040303.hifi_reads.fastq.gz > m64268e.paf
+minimap2 -x map-hifi -t 75 mgal.hic.a_ctg.fa m64270e_220718_123105.hifi_reads.fastq.gz > m64270e.paf
+pbcstat *.paf
+calcuts PB.stat > cutoffs 2>calcults.log
+split_fa mgal.hic.a_ctg.fa > asm.split
+minimap2 -t 150 -xasm5 -DP asm.split asm.split > asm.split.self.paf
+purge_dups -2 -T cutoffs -c PB.base.cov asm.split.self.paf > dups.bed 2> purge_dups.log
+get_seqs dups.bed mgal.hic.a_ctg.fa
+
+# SALSA
+## Arima-HiC mapping pipeline
+## bwa index
+bwa index -a bwtsw primary.fa
+## fastq to bam
+bwa mem -t 140 primary.fa forward.fq.gz | samtools view -@ 10 -Sb - > forward.bam
+bwa mem -t 140 primary.fa backward.fq.gz | samtools view -@ 10 -Sb - > backward.bam
+## filter 5' end
+samtools view -h forward.bam | perl /home/mapping_pipeline/filter_five_end.pl | samtools view -Sb - > filter_forward.bam
+samtools view -h backward.bam | perl /home/mapping_pipeline/filter_five_end.pl | samtools view -Sb - > filter_backward.bam
+## pair reads & mapping quality filter
+perl /home/mapping_pipeline/two_read_bam_combiner.pl filter_forward.bam filter_backward.bam samtools 10 | samtools view -bS -t primary.fa.fai - | samtools sort -@ 10 -o sra.bam -
+## add read group
+java -Xmx128G -Djava.io.tmpdir=temp/ -jar /home/gatk/picard.jar AddOrReplaceReadGroups INPUT=sra.bam OUTPUT=paired.sra.bam ID=MGAL LB=MGAL SM=MGAL1 PL=ILLUMINA PU=none
+## mark duplicates
+java -Xmx128G -XX:-UseGCOverheadLimit -Djava.io.tmpdir=temp/ -jar /home/gatk/picard.jar MarkDuplicates INPUT=paired.sra.bam OUTPUT=mgal.primary.bam METRICS_FILE=metrics.mgal.txt TMP_DIR=temp/ ASSUME_SORTED=TRUE VALIDATION_STRINGENCY=LENIENT REMOVE_DUPLICATES=TRUE
+##
+samtools index mgal.primary.bam
+perl /home/mapping_pipeline/get_stats.pl mgal.primary.bam > mgal.primary.bam.stats
+##
+bamToBed -i mgal.primary.bam > alignment.bed
+sort -k 4 alignment.bed > tmp && mv tmp alignment.bed
+##
+python /home/SALSA/run_pipeline.py -a primary.fa -l primary.fa.fai -b alignment.bed -e GATC -o scaffolds -m yes -i 20 -p yes
+
+# yagcloser
+minimap2 -t 120 --secondary=yes -ax map-pb scaffolds_FINAL.fasta hifi_reads.fastq | samtools view -hSb - | samtools sort - > aln.s.bam
+samtools index aln.s.bam
+/home/asset-master/src/detgaps scaffolds_FINAL.fasta > final.gaps.bed
+python /home/yagcloser/yagcloser.py -g scaffolds_FINAL.fasta \
+    -a aln.s.bam \
+    -b final.gaps.bed \
+    -o yagcloser_output \
+    -s reference_data \
+    -mins 2 -f 20 -mcc 2 -prt 0.25 -eft 0.2 -pld 0.2
+python /home/yagcloser/scripts/update_assembly_edits_and_breaks.py \
+    -i scaffolds_FINAL.fasta \
+    -o scaffolds_v2.fasta \
+    -e yagcloser_output/reference_data.edits.txt
+
+# Hi-C Contact map generation
+## get chrom.sizes
+samtools faidx scaffolds_v2.fasta
+cut -f1,2 scaffolds_v2.fasta.fai > scaffolds_v2.chrom.sizes
+## align hi-c data to reference genome
+bwa index scaffolds_v2.fasta && bwa mem -5SP -t 145 scaffolds_v2.fasta forward.fq backward.fq | samtools view -@ 5 -bhs - > out.bam
+## filter
+samtools view -h out.bam | pairtools parse -c scaffolds_v2.chrom.sizes -o parsed.pairsam
+## sort
+pairtools sort --nproc 8 -o sorted.pairsm parsed.pairsam
+## remove duplicate
+pairtools dedup --mark-dups -o deduped.pairsam sorted.pairsam
+## select
+pairtools select \
+'(pair_type == "UU") or (pair_type == "UR") or (pair_type == "RU")' \
+-o filtered.pairsam deduped.pairsam
+## split
+pairtools split --output-sam output.sam filtered.pairsam
+## create contact map
+samtools view -h output.sam | PretextMap -o map.pretext --sortby length --sortorder descend --mapq 10
+
+# BUSCO
+## download database
+wget https://busco-data.ezlab.org/v5/data/lineages/mollusca_odb10.2020-08-05.tar.gz
+## run busco
+busco -m genome -i primary.fasta -l /mnt/work/blastdb/busco/mollusca_odb10 -o mgal
+
+# merqury
+## make db
+meryl k=21 count output reads1.meryl illumina_1.fq
+meryl k=21 count output reads2.meryl illumina_2.fq
+meryl union-sum output genome.meryl read*.meryl
+## run merqury
+merqury.sh genome.meryl primary.fasta alternate.fasta final
+
+# structural variation
+## Identify tandem repeats in genome assembly and convert output to zero-based six field bed file.
+###
+trf mgal_genome_final.fa 2 7 7 80 10 50 500 -d -h
+###
+python TRFdat_to_bed.py --dat mgal_genome_final.fa.2.7.7.80.10.50.500.dat --bed mgal_genome_final.fa.2.7.7.80.10.50.500.bed
+###
+awk '{print $1"\t"$2-1"\t"$3"\t"$4}' mgal_genome_final.fa.2.7.7.80.10.50.500.bed | sed 's/Sequence://' | awk '{print $0"\t"$3-$2"\t1"}' > mgal_genome_final.fa.2.7.7.80.10.50.500_0based_6field.bed
+## Align PacBio reads to genome assembly with the minimap2 wrapper pbmm2.
+###
+minimap2 -ax map-hifi -Y --MD -t 150 mgal_genome_final.fa /mnt/work/sra/hifi_reads.fastq.gz > aln.sam
+###
+samtools view -@ 20 -bh aln.sam -o | samtools sort -@ 20 > genome.aligned.bam
+###
+java -jar /home/gatk/picard.jar AddOrReplaceReadGroups \
+      I=genome.aligned.bam \
+      O=output.bam \
+      RGID=4 \
+      RGLB=lib1 \
+      RGPL=PACBIO \
+      RGPU=unit1 \
+      RGSM=yt1
+###
+pbsv discover --tandem-repeats mgal_genome_final.fa.2.7.7.80.10.50.500_0based_6field.bed output.bam genome.svsig.gz
+###
+nohup pbsv call -j 16 mgal_genome_final.fa genome.svsig.gz genome.var.vcf &
+## Extract deletions (DELs) and insertions (INSs) for which two alleles can be detected to avoid likely false positives that occur due to genome assembly errors.
+###
+grep DEL genome.var.vcf | grep PASS | grep -v '1/1' | awk '{print $1"\t"$2-1"\t"$2+length($4)-1"\t"$3}' | awk '{print $0"\t"$3-$2"\t1"}' > genome.var.DEL.6field.bed
+###
+grep INS genome.var.vcf | grep PASS | grep -v -P '1/1' | awk '{print $1"\t"$2-1"\t"$2+length($5)-1"\t"$3}' | awk '{print $0"\t"$3-$2"\t1"}' > genome.var.INS.6field.bed
+###
+awk '{sum += $5};END {print sum}' genome.var.DEL.6field.bed
+awk '{sum += $5};END {print sum}' genome.var.INS.6field.bed
+
+# repeatmodeler
+python famdb.py -i /mnt/work/RepeatMasker/Libraries/famdb lineage -ad Bivalvia 
+python famdb.py -i /mnt/work/RepeatMasker/Libraries/famdb families -ad Bivalvia -f embl > Bivalvia.embl
+perl util/buildRMLibFromEMBL.pl Bivalvia.embl > Bivalvia_embl.fasta
+cat mgal-families.fa Bivalvia_embl.fasta > repeat.fasta
+./RepeatMasker -nolow -norna -no_is -e ncbi -pa 150 -lib repeat.fasta -gff -xsmall -dir softmaskred mgal_genome_final.fa
+
+# hisat2
+hisat2-build -p 10 mgal_genome_final.fa.masked mgal &
+hisat2 -p 20 -x mgal -1 SRR1042397_1.fq.gz -2 SRR1042397_2.fq.gz | samtools sort -@ 10 > SRR1042397.bam &
+hisat2 -p 20 -x mgal -1 SRR1045900_1.fq.gz -2 SRR1045900_2.fq.gz | samtools sort -@ 10 > SRR1045900.bam &
+hisat2 -p 20 -x mgal -1 SRR1046115_1.fq.gz -2 SRR1046115_2.fq.gz | samtools sort -@ 10 > SRR1046115.bam &
+hisat2 -p 20 -x mgal -1 SRR1046116_1.fq.gz -2 SRR1046116_2.fq.gz | samtools sort -@ 10 > SRR1046116.bam &
+hisat2 -p 20 -x mgal -1 SRR1046117_1.fq.gz -2 SRR1046117_2.fq.gz | samtools sort -@ 10 > SRR1046117.bam &
+hisat2 -p 20 -x mgal -1 SRR1046118_1.fq.gz -2 SRR1046118_2.fq.gz | samtools sort -@ 10 > SRR1046118.bam &
+hisat2 -p 20 -x mgal -1 SRR1046119_1.fq.gz -2 SRR1046119_2.fq.gz | samtools sort -@ 10 > SRR1046119.bam &
+
+# braker2
+braker.pl --cores 48 --species=mgal_f \
+--genome=mgal_genome_final.fa.masked --softmasking \
+--bam=SRR1042397.bam,SRR1045900.bam,SRR1046115.bam,SRR1046116.bam,SRR1046117.bam,SRR1046118.bam,SRR1046119.bam \
+--prot_seq=sequence.fasta \
+--gff3 \
+--skip_fixing_broken_genes \
+--CDBTOOLS_PATH=/home/cdbfasta \
+--GENEMARK_PATH=/home/gmes_linux_64_4 \
+--AUGUSTUS_CONFIG_PATH=/home/augustus/config \
+--AUGUSTUS_BIN_PATH=/home/augustus/bin \
+--AUGUSTUS_SCRIPTS_PATH=/home/augustus/src \
+--PYTHON3_PATH=/home/mambaforge-pypy3/envs/braker2/bin \
+--etpmode \
+--PROTHINT_PATH=/home/ProtHint/bin
+
+# Trinity
+samtools merge -o all.bam SRR1042397.bam SRR1045900.bam SRR1046115.bam SRR1046116.bam SRR1046117.bam SRR1046118.bam SRR1046119.bam
+Trinity --genome_guided_bam all.sorted.bam --max_memory 250G --genome_guided_max_intron 20000 --CPU 96
+
+# PASA
+/home/mambaforge-pypy3/envs/pasa/opt/pasa-2.5.2/Launch_PASA_pipeline.pl --CPU 150 \
+-c /home/mambaforge-pypy3/envs/pasa/opt/pasa-2.5.2/pasa_conf/alignAssembly.config -C -R \
+-g /mnt/work/genome/pasa/MytGallo1_primary.fa \
+-t /mnt/work/genome/pasa/Trinity-GG.fasta \
+--ALIGNERS blat,gmap
+
+# EVidenceModeler
+## make weights file
+echo -e "ABINITIO_PREDICTION\tAUGUSTUS\t1" >> weights.txt
+echo -e "TRANSCRIPT\tassembler-mydb.sqlite\t10" >> weights.txt
+## convert to evm gff3 file
+augustus_GFF3_to_EVM_GFF3.pl augustus.hints.gff3 > augustus.evm.gff3
+## run EVidenceModeler
+EVidenceModeler --CPU 150 \
+--sample_id mgal \
+--weights weights.txt \
+--genome mgal_genome_final.fa \
+--gene_predictions augustus.evm.gff3 \
+--transcript_alignments mydb.sqlite.pasa_assemblies.gff3 \
+--segmentSize 100000 \
+--overlapSize 10000
+
+# functional annotation
+## UniProt
+blastp \
+-query mgal_genome_final.prot.fa \
+-db /mnt/work/blastdb/swissprot/swissprot \
+-out mgal_genome_final.prot.swissprot.txt \
+-outfmt "10 evalue length qseqid qlen qstart qend sacc slen sstart send pident nident sstrand qcovs qseq sseq sgi stitle" \
+-num_threads 152 -evalue 1e-5 -max_target_seqs 1 \
+-max_hsps 1
+## GO
+interproscan.sh \
+-iprlookup -pa KEGG -goterms \
+-i mgal_genome_final.prot.fa \
+-o prot.go.tsv \
+-cpu 150 -f tsv
+## KEGG
+/kofam_scan-1.3.0/exec_annotation \
+-o gene2K.txt mgal_genome_final.prot.fa \
+--cpu 150 --format mapper  -e 1e-5
